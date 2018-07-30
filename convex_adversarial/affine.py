@@ -4,6 +4,8 @@ import torch.nn as nn
 from torch.autograd import Variable
 import torch.nn.functional as F
 from .utils import Dense
+from .linearlike import LinearLikeLayer
+
 
 # Conversion functions to turn layers into affine layers
 def toAffineTranspose(l): 
@@ -38,6 +40,8 @@ def full_bias(l, n=None):
     # output dimension of n must be specified. 
     if isinstance(l, nn.Linear): 
         return l.bias.view(1,-1)
+    elif isinstance(l, LinearLikeLayer):
+        return l.getBias().view(1,-1)
     elif isinstance(l, nn.Conv2d): 
         if n is None: 
             raise ValueError("Need to pass n=<output dimension>")
