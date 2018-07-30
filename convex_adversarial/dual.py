@@ -9,6 +9,7 @@ import numpy as np
 
 from . import affine as Aff
 from .utils import Dense, DenseSequential
+from .linearlike import LinearLikeLayer
 
 import warnings
 
@@ -146,6 +147,45 @@ class InfBallProjBounded():
             return zl,zu
         else: 
             return InfBall.fval(self, nu=nu, nu_prev=nu_prev)
+            
+            
+class DualLinearLike(nn.Module): 
+    def __init__(self, layer, out_features): 
+        super(DualLinearLike, self).__init__()
+        if not isinstance(layer, LinearLikeLayer):
+            raise ValueError("Expected LinearLikeLayer input.")
+        self.layer = layer
+        if layer.getBias() is None: 
+            self.bias = None
+        else: 
+            self.bias = [Aff.full_bias(layer, out_features[1:])]
+
+    def apply(self, dual_layer): 
+        if self.bias is not None: 
+            self.bias.append(dual_layer.affine(*self.bias))
+
+    def fval(self, nu=None, nu_prev=None): 
+        if nu is None: 
+            if self.bias is None: 
+                return 0,0
+            else: 
+                return self.bias[-1], self.bias[-1]
+        else:
+            if self.bias is None: 
+                return 0
+            else:
+                nu = nu.view(nu.size(0), nu.size(1), -1)
+                return -nu.matmul(self.bias[0].view(-1))
+
+    def affine(self, *xs): 
+        x = xs[-1]
+        return F.linear(x, self.layer.getWeight())
+
+    def affine_transpose(self, *xs): 
+        x = xs[-1]
+        return F.linear(x, self.layer.getWeight().t())        
+
+
 
 class DualLinear(nn.Module): 
     def __init__(self, layer, out_features): 
@@ -411,6 +451,8 @@ class DualDense(nn.Module):
                 dual_layer = DualConv2d(W, out_features)
             elif isinstance(W, nn.Linear): 
                 dual_layer = DualLinear(W, out_features)
+            elif isinstance(W, LinearLikeLayer):
+                dual_layer = DualLinearLike(W, out_features)
             elif isinstance(W, nn.Sequential) and len(W) == 0: 
                 dual_layer = Identity()
             elif W is None:
@@ -528,6 +570,8 @@ def select_input(X, epsilon, l1_proj, l1_type, bounded_input):
 def select_layer(layer, dual_net, X, l1_proj, l1_type, in_f, out_f, dense_ti, zsi):
     if isinstance(layer, nn.Linear): 
         return DualLinear(layer, out_f)
+    elif isinstance(layer, LinearLikeLayer): 
+        return DualLinearLike(layer, out_f)
     elif isinstance(layer, nn.Conv2d): 
         return DualConv2d(layer, out_f)
     elif isinstance(layer, nn.ReLU):   
@@ -660,7 +704,7 @@ class DualSequential(nn.Module):
         return zs[-1]
 
 def dual_helper(dual_layer, D): 
-    if isinstance(dual_layer, (DualLinear, DualConv2d)): 
+    if isinstance(dual_layer, (DualLinear, DualConv2d, DualLinearLike)): 
         b = dual_layer.bias[0]
         if isinstance(dual_layer, DualConv2d): 
             b = b.unsqueeze(0)
