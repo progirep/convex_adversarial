@@ -1,3 +1,5 @@
 from .dual import DualNetBounds, robust_loss, robust_loss_parallel
 from .utils import DenseSequential, Dense, epsilon_from_model
-from .linearlike import LinearLikeLayer
+from .linearlike import LinearLikeLayer, SplitNetwork
+
+
