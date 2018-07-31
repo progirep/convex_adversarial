@@ -6,6 +6,7 @@
 [scalable_paper]: https://arxiv.org/abs/1805.12514
 
 ## News
++ 7/26/2018 - Version 0.3.3 code refactor
 + 6/2/2018 - Version 0.3.1 released to reflect the new paper. 
 + 5/31/2018 - New paper on a scalable version for models with skip connections
 and a fully modular implementation for simple extension. Code base with these
@@ -38,37 +39,15 @@ The package contains the following functions:
     only for a *single* example and using  
     data parallelism. This is useful for exact evaluation if a single 
     example doesn't fit in memory. 
-+ `DualNetBounds(net, X, epsilon, l1_proj=None, l1_type='exact', bounded_input=False)`
-    is a class that computes the layer-wise upper and lower bounds for all
-    activations in the network. This is useful if you are only interested 
++ `dual_net = DualNetwork(net, X, epsilon, l1_proj=None, l1_type='exact', bounded_input=False)`
+    is a PyTorch module that computes the layer-wise upper and lower bounds for
+    all activations in the network. This is useful if you are only interested 
     in the bounds and not the robust loss, and corresponds to Algorithm 
     1 in the paper. 
-+ `DualNetBounds.g(self, c)` is a class function that computes the lower
++ `dual_net(c)` is the module's forward pass which computes the lower
     bound on the primal problem described in the paper for a given 
     objective vector c. This corresponds to computing objective of Theorem 1 in
     the paper (Equation 5). 
-
-### Residual networks / skip connections
-
-To create sequential PyTorch modules with skip connections, we provide a
-generalization of the PyTorch module `nn.Sequential`. Specifically, we have a
-`DenseSequential` module that is identical to `nn.Sequential` but also takes
-in `Dense' modules. The `Dense' modules consist of `m` layers, and applies
-these `m` layers to the last `m` outputs of the network. 
-
-As an example, the
-following is a simple two layer network with a single skip connection. 
-The first layer is identical to a normal `nn.Conv2d` layer. The second layer has
-a skip connection from the layer with 16 filters and also a normal convolutional
-layer from the previous layer with 32 filters. 
-
-```python
-residual_block = DenseSequential([
-    Dense(nn.Conv2d(16,32,...)),
-    nn.ReLU(), 
-    Dense(nn.Conv2d(16,32,...), None, nn.Conv2d(32,32,...))
-])
-```
 
 ## Why do we need robust networks? 
 While networks are capable of representing highly complex functions. For
@@ -153,30 +132,101 @@ random projections on residual networks and on the CIFAR10 dataset can be found
 in our [second paper][scalable_paper].
 
 ## Modularity
+
+### Dual operations
+The package currently has dual operators for the following constrained input
+spaces and layers. These are defined in `dual_inputs.py` and `dual_layers.py`. 
+
+#### Dual input spaces
++ `InfBall` : L-infinity ball constraint on the input
++ `InfBallBounded` : L-infinity ball constraint on the input, with additional
+bounding box constraints (works for [0,1] box constraints). 
++ `InfBallProj` : L-infinity ball constraint using Cauchy random projections
++ `InfBallProjBounded` : L-infinity ball constraint using Cauchy random
+projections, with additional bounding box constraints (works for [0,1] box
+constraints)
+
+#### Dual layers
++ `DualLinear` : linear, fully connected layers
++ `DualConv2d` : 2d convolutional layers
++ `DualReshape` : reshaping layers, e.g. flattening dimensions
++ `DualReLU` : ReLU activations
++ `DualReLUProj` : ReLU activations using Cauchy random projections
++ `DualDense` : Dense layers, for skip connections
++ `DualBatchNorm2d` : 2d batch-norm layers, assuming a fixed mean and variance
++ `Identity` : Identity operator, e.g. for some ResNet skip connections
+
 Due to the modularity of the implementation, it is easy to extend the
-methodology to additional dual layers. A dual layer can be implemented by
-filling in the following signature: 
+methodology to additional dual layers. A dual input or dual layer can be
+implemented by filling in the following signature: 
 
 ```python
-class DualLayer(nn.Module): 
-    def apply(self, dual_layer): 
-        ''' Pass variables needed to compute the objective through the given
-        dual layer. '''
-        pass
+class DualObject(nn.Module, metaclass=ABCMeta): 
+    @abstractmethod
+    def __init__(self): 
+        """ Initialize a dual layer by initializing the variables needed to
+        compute this layer's contribution to the upper and lower bounds. 
 
-    def fval(self, nu=None, nu_prev=None): 
-        ''' Compute the objective value of the dual layer (h_i). '''
-        pass
+        In the paper, if this object is at layer i, this is initializing `h'
+        with the required cached values when nu[i]=I and nu[i]=-I. 
+        """pass
 
-    def affine(self, *xs): 
-        ''' Given previous layer outputs xs, apply the affine dual layer
-        (g_ij). '''
-        pass
+    @abstractmethod
+    def apply(self, dual_layer):
+        """ Advance cached variables initialized in this class by the given
+        dual layer.  """
+        raise NotImplementedError
 
-    def affine_transpose(self, *xs): 
-        ''' Given previous layer outputs xs, apply the transpose of the affine
-        dual layer (g_ij^T). '''
-        pass
+    @abstractmethod
+    def bounds(self): 
+        """ Return this layers contribution to the upper and lower bounds. In
+        the paper, this is the `h' upper bound where nu is implicitly given by
+        c=I and c=-I. """
+        raise NotImplementedError
+
+    @abstractmethod
+    def objective(self, *nus): 
+        """ Return this layers contribution to the objective, given some
+        backwards pass. In the paper, this is the `h' upper bound evaluated on a
+        the given nu variables. 
+
+        If this is layer i, then we get as input nu[k] through nu[i]. 
+        So non-residual layers will only need nu[-1] and nu[-2]. """
+        raise NotImplementedError
+
+class DualLayer(DualObject): 
+    @abstractmethod
+    def forward(self, *xs): 
+        """ Given previous inputs, apply the affine layer (forward pass) """ 
+        raise NotImplementedError
+
+    @abstractmethod
+    def T(self, *xs): 
+        """ Given previous inputs, apply the transposed affine layer 
+        (backward pass) """
+        raise NotImplementedError
+```
+
+## Residual networks / skip connections
+
+To create sequential PyTorch modules with skip connections, we provide a
+generalization of the PyTorch module `nn.Sequential`. Specifically, we have a
+`DenseSequential` module that is identical to `nn.Sequential` but also takes
+in `Dense' modules. The `Dense' modules consist of `m` layers, and applies
+these `m` layers to the last `m` outputs of the network. 
+
+As an example, the
+following is a simple two layer network with a single skip connection. 
+The first layer is identical to a normal `nn.Conv2d` layer. The second layer has
+a skip connection from the layer with 16 filters and also a normal convolutional
+layer from the previous layer with 32 filters. 
+
+```python
+residual_block = DenseSequential([
+    Dense(nn.Conv2d(16,32,...)),
+    nn.ReLU(), 
+    Dense(nn.Conv2d(16,32,...), None, nn.Conv2d(32,32,...))
+])
 ```
 
 ## What is in this repository? 
