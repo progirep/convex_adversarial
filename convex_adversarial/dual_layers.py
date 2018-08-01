@@ -3,17 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .dual import DualLayer
-from .utils import full_bias
+from .utils import full_bias, Dense
 
-
-def select_layer(layer, dual_net, X, l1_proj, l1_type, in_f, out_f, dense_ti, zsi):
+def select_layer(layer, dual_net, X, l1_proj, l1_type, in_f, out_f, zsi,
+                 zl=None, zu=None):
     if isinstance(layer, nn.Linear): 
         return DualLinear(layer, out_f)
     elif isinstance(layer, nn.Conv2d): 
         return DualConv2d(layer, out_f)
     elif isinstance(layer, nn.ReLU):   
-        zl, zu = zip(*[l.bounds() for l in dual_net])
-        zl, zu = sum(zl), sum(zu)
+        if zl is None and zu is None:
+            zl, zu = zip(*[l.bounds() for l in dual_net])
+            # for l,dn in zip(zl,dual_net):
+            #     print(dn, l.size())
+            zl, zu = sum(zl), sum(zu)
+        if zl is None or zu is None: 
+            raise ValueError("Must either provide both l,u bounds or neither.")
 
         I = ((zu > 0).detach() * (zl < 0).detach())
         if l1_proj is not None and l1_type=='median' and I.sum().item() > l1_proj:
@@ -24,8 +29,7 @@ def select_layer(layer, dual_net, X, l1_proj, l1_type, in_f, out_f, dense_ti, zs
     elif 'Flatten' in (str(layer.__class__.__name__)): 
         return DualReshape(in_f, out_f)
     elif isinstance(layer, Dense): 
-        assert isinstance(dense_ti, Dense)
-        return DualDense(layer, dense_ti, dual_net, out_f)
+        return DualDense(layer, dual_net, out_f)
     elif isinstance(layer, nn.BatchNorm2d):
         return DualBatchNorm2d(layer, zsi, out_f)
     else:
@@ -52,11 +56,17 @@ class DualLinear(DualLayer):
         if self.bias is not None: 
             self.bias.append(dual_layer(*self.bias))
 
-    def bounds(self):
+    def bounds(self, network=None):
         if self.bias is None: 
             return 0,0
         else: 
-            return self.bias[-1], self.bias[-1]
+            if network is None: 
+                b = self.bias[-1]
+            else:
+                b = network(self.bias[0])
+            if b is None:
+                return 0,0
+            return b,b
 
     def objective(self, *nus): 
         if self.bias is None: 
@@ -68,6 +78,8 @@ class DualLinear(DualLayer):
 
     def forward(self, *xs): 
         x = xs[-1]
+        if x is None: 
+            return None
         return F.linear(x, self.layer.weight)
 
     def T(self, *xs): 
@@ -148,7 +160,7 @@ class DualReshape(DualLayer):
     def apply(self, dual_layer): 
         pass
 
-    def bounds(self): 
+    def bounds(self, network=None): 
         return 0,0
 
     def objective(self, *nus): 
@@ -191,17 +203,23 @@ class DualReLU(DualLayer):
         else: 
             self.nus.append(dual_layer(*self.nus))
 
-    def bounds(self): 
+    def bounds(self, network=None): 
         if self.I_empty: 
             return 0,0
-        nu = self.nus[-1]
+        if network is None: 
+            nu = self.nus[-1]
+        else:
+            nu = network(self.nus[0])
+        if nu is None: 
+            return 0,0
+        size = nu.size()
         nu = nu.view(nu.size(0), -1)
         zlI = self.zl[self.I]
         zl = (zlI * (-nu.t()).clamp(min=0)).mm(self.I_collapse).t().contiguous()
         zu = -(zlI * nu.t().clamp(min=0)).mm(self.I_collapse).t().contiguous()
-        
-        zl = zl.view(-1, *(self.nus[-1].size()[1:]))
-        zu = zu.view(-1, *(self.nus[-1].size()[1:]))
+
+        zl = zl.view(-1, *(size[1:]))
+        zu = zu.view(-1, *(size[1:]))
         return zl,zu
 
     def objective(self, *nus): 
@@ -217,6 +235,8 @@ class DualReLU(DualLayer):
 
     def forward(self, *xs, I_ind=None): 
         x = xs[-1]
+        if x is None:
+            return None
 
         if self.d.is_cuda:
             d = self.d.cuda(device=x.get_device())
@@ -274,12 +294,18 @@ class DualReLUProj(DualReLU):
         self.nus.append(dual_layer(*self.nus))
         self.nu_ones.append(dual_layer(*self.nu_ones))
 
-    def bounds(self): 
+    def bounds(self, network=None): 
         if self.I_empty: 
             return 0,0
 
+        if network is None: 
+            nu = self.nus[-1]
+            no = self.nu_ones[-1]
+        else: 
+            nu = network(self.nus[0])
+            no = network(self.nu_ones[0])
+
         n = torch.median(self.nus[-1].abs(), 1)[0]
-        no = self.nu_ones[-1]
 
         # From notes: 
         # \sum_i l_i[nu_i]_+ \approx (-n + no)/2
@@ -293,7 +319,7 @@ class DualReLUProj(DualReLU):
         return zl,zu
 
 class DualDense(DualLayer): 
-    def __init__(self, dense, dense_t, net, out_features): 
+    def __init__(self, dense, net, out_features): 
         super(DualDense, self).__init__()
         self.duals = nn.ModuleList([])
         for i,W in enumerate(dense.Ws): 
@@ -320,12 +346,17 @@ class DualDense(DualLayer):
 
     def forward(self, *xs): 
         duals = list(self.duals)[-min(len(xs),len(self.duals)):]
-        return sum(W(*xs[:i+1]) 
+        if all(W is None for W in duals): 
+            return None
+        out = [W(*xs[:i+1]) 
             for i,W in zip(range(-len(duals) + len(xs), len(xs)),
-                duals) if W is not None)
+                duals) if W is not None]
+        return sum(o for o in out if o is not None)
 
     def T(self, *xs): 
         dual_ts = list(self.dual_ts)[-min(len(xs),len(self.dual_ts)):]
+        if all(W is None for W in dual_ts): 
+            return None
         return sum(W.T(*xs[:i+1]) 
             for i,W in zip(range(-len(dual_ts) + len(xs), len(xs)),
                 dual_ts) if W is not None)
@@ -335,8 +366,9 @@ class DualDense(DualLayer):
             if W is not None: 
                 W.apply(dual_layer)
 
-    def bounds(self): 
-        fvals = list(W.bounds() for W in self.duals if W is not None)
+    def bounds(self, network=None): 
+        fvals = list(W.bounds(network=network) for W in self.duals 
+                        if W is not None)
         l,u = zip(*fvals)
         return sum(l), sum(u)
 
@@ -376,8 +408,11 @@ class DualBatchNorm2d(DualLayer):
     def apply(self, dual_layer): 
         self.ds.append(dual_layer(*self.ds))
 
-    def bounds(self):
-        d = self.ds[-1]
+    def bounds(self, network=None):
+        if network is None:
+            d = self.ds[-1]
+        else:
+            d = network(self.ds[0])
         return d, d
 
     def objective(self, *nus): 
@@ -396,7 +431,7 @@ class Identity(DualLayer):
     def apply(self, dual_layer): 
         pass
 
-    def bounds(self): 
+    def bounds(self, network=None): 
         return 0,0
 
     def objective(self, *nus): 
