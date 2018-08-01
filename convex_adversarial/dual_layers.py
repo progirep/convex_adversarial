@@ -4,11 +4,14 @@ import torch.nn.functional as F
 
 from .dual import DualLayer
 from .utils import full_bias, Dense
+from .linearlike import LinearLikeLayer
 
 def select_layer(layer, dual_net, X, l1_proj, l1_type, in_f, out_f, zsi,
                  zl=None, zu=None):
     if isinstance(layer, nn.Linear): 
         return DualLinear(layer, out_f)
+    elif isinstance(layer, LinearLikeLayer): 
+        return DualLinearLike(layer, out_f)
     elif isinstance(layer, nn.Conv2d): 
         return DualConv2d(layer, out_f)
     elif isinstance(layer, nn.ReLU):   
@@ -436,3 +439,43 @@ class Identity(DualLayer):
 
     def objective(self, *nus): 
         return 0
+        
+
+class DualLinearLike(DualLayer): 
+    def __init__(self, layer, out_features): 
+        super(DualLinearLike, self).__init__()
+        if not isinstance(layer, LinearLikeLayer):
+            raise ValueError("Expected LinearLikeLayer input.")
+        self.layer = layer
+        if layer.getBias() is None: 
+            self.bias = None
+        else: 
+            self.bias = [full_bias(layer, out_features[1:])]
+
+    def apply(self, dual_layer): 
+        if self.bias is not None: 
+            self.bias.append(dual_layer(*self.bias))
+
+    def bounds(self):
+        if self.bias is None: 
+            return 0,0
+        else: 
+            return self.bias[-1], self.bias[-1]
+
+    def objective(self, *nus): 
+        if self.bias is None: 
+            return 0
+        else:
+            nu = nus[-2]
+            nu = nu.view(nu.size(0), nu.size(1), -1)
+            return -nu.matmul(self.bias[0].view(-1))
+
+    def forward(self, *xs): 
+        x = xs[-1]
+        return F.linear(x, self.layer.getWeight())
+
+    def T(self, *xs): 
+        x = xs[-1]
+        return F.linear(x, self.layer.getWeight().t())   
+
+        
