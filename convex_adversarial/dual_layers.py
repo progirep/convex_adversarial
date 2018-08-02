@@ -14,12 +14,13 @@ def select_layer(layer, dual_net, X, l1_proj, l1_type, in_f, out_f, zsi,
         return DualLinearLike(layer, out_f)
     elif isinstance(layer, nn.Conv2d): 
         return DualConv2d(layer, out_f)
-    elif isinstance(layer, nn.ReLU):   
+    elif isinstance(layer, nn.ReLU):
         if zl is None and zu is None:
             zl, zu = zip(*[l.bounds() for l in dual_net])
+
             # for l,dn in zip(zl,dual_net):
             #     print(dn, l.size())
-            zl, zu = sum(zl), sum(zu)
+            zl, zu = sum([a for a in zl if not a is None]), sum([a for a in zu if not a is None])
         if zl is None or zu is None: 
             raise ValueError("Must either provide both l,u bounds or neither.")
 
@@ -330,6 +331,8 @@ class DualDense(DualLayer):
                 dual_layer = DualConv2d(W, out_features)
             elif isinstance(W, nn.Linear): 
                 dual_layer = DualLinear(W, out_features)
+            elif isinstance(W, LinearLikeLayer): 
+                dual_layer = DualLinearLike(W, out_features)
             elif isinstance(W, nn.Sequential) and len(W) == 0: 
                 dual_layer = Identity()
             elif W is None:
@@ -441,11 +444,12 @@ class Identity(DualLayer):
         return 0
         
 
+
 class DualLinearLike(DualLayer): 
     def __init__(self, layer, out_features): 
         super(DualLinearLike, self).__init__()
         if not isinstance(layer, LinearLikeLayer):
-            raise ValueError("Expected LinearLikeLayer input.")
+            raise ValueError("Expected LinearLike layer.")
         self.layer = layer
         if layer.getBias() is None: 
             self.bias = None
@@ -456,11 +460,17 @@ class DualLinearLike(DualLayer):
         if self.bias is not None: 
             self.bias.append(dual_layer(*self.bias))
 
-    def bounds(self):
+    def bounds(self, network=None):
         if self.bias is None: 
             return 0,0
         else: 
-            return self.bias[-1], self.bias[-1]
+            if network is None: 
+                b = self.bias[-1]
+            else:
+                b = network(self.bias[0])
+            if b is None:
+                return 0,0
+            return b,b
 
     def objective(self, *nus): 
         if self.bias is None: 
@@ -472,10 +482,13 @@ class DualLinearLike(DualLayer):
 
     def forward(self, *xs): 
         x = xs[-1]
+        if x is None: 
+            return None
         return F.linear(x, self.layer.getWeight())
 
     def T(self, *xs): 
         x = xs[-1]
-        return F.linear(x, self.layer.getWeight().t())   
+        return F.linear(x, self.layer.getWeight().t())
+        
 
         
